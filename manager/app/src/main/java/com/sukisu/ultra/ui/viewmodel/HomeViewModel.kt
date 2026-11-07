@@ -1,0 +1,167 @@
+package com.sukisu.ultra.ui.viewmodel
+
+import android.content.Context
+import android.os.Build
+import android.system.Os
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import com.sukisu.ultra.BuildConfig
+import com.sukisu.ultra.Natives
+import com.sukisu.ultra.data.repository.SettingsRepository
+import com.sukisu.ultra.data.repository.SettingsRepositoryImpl
+import com.sukisu.ultra.getKernelVersion
+import com.sukisu.ultra.ksuApp
+import com.sukisu.ultra.ui.screen.home.HomeUiState
+import com.sukisu.ultra.ui.screen.home.SystemInfo
+import com.sukisu.ultra.ui.screen.home.getManagerVersion
+import com.sukisu.ultra.ui.util.checkNewCiVersion
+import com.sukisu.ultra.ui.util.checkNewVersion
+import com.sukisu.ultra.ui.util.getKpmModuleCount
+import com.sukisu.ultra.ui.util.getKpmVersion
+import com.sukisu.ultra.ui.util.getModuleCount
+import com.sukisu.ultra.ui.util.getSuperuserCount
+import com.sukisu.ultra.ui.util.getSELinuxStatusRaw
+import com.sukisu.ultra.ui.util.module.LatestVersionInfo
+import com.sukisu.ultra.ui.util.resolveDeviceName
+import com.sukisu.ultra.ui.util.rootAvailable
+
+class HomeViewModel(
+    private val settingsRepo: SettingsRepository = SettingsRepositoryImpl()
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(buildState())
+    val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
+
+    private var refreshJob: kotlinx.coroutines.Job? = null
+
+    fun refresh() {
+        refreshJob?.cancel()
+        refreshJob = viewModelScope.launch {
+            val baseState = withContext(Dispatchers.IO) { buildState() }
+            _uiState.update { current ->
+                baseState.copy(
+                    superuserCount = current.superuserCount,
+                    moduleCount = current.moduleCount,
+                    kpmCount = current.kpmCount,
+                    ciUpdateBusy = current.ciUpdateBusy,
+                )
+            }
+            if ((baseState.isManager || baseState.isPreviewMode) && baseState.isRootAvailable) {
+                val counts = withContext(Dispatchers.IO) { loadCounts(baseState.lkmMode, baseState.isPreviewMode) }
+                _uiState.update {
+                    it.copy(superuserCount = counts.first, moduleCount = counts.second, kpmCount = counts.third)
+                }
+            }
+            if (baseState.checkUpdateEnabled) {
+                val latestVersionInfo = withContext(Dispatchers.IO) { checkNewVersion() }
+                _uiState.update { it.copy(latestVersionInfo = latestVersionInfo) }
+            }
+            if (baseState.checkCiUpdateEnabled) {
+                val ciVersionInfo = withContext(Dispatchers.IO) { checkNewCiVersion() }
+                _uiState.update { it.copy(ciLatestVersionInfo = ciVersionInfo) }
+            }
+        }
+    }
+
+    fun installCiUpdate() = installUpdate(isCi = true)
+
+    fun installReleaseUpdate() = installUpdate(isCi = false)
+
+    private fun installUpdate(isCi: Boolean) {
+        val info = if (isCi) _uiState.value.ciLatestVersionInfo else _uiState.value.latestVersionInfo
+        if (info.versionCode <= _uiState.value.currentManagerVersionCode || info.downloadUrl.isBlank()) return
+        if (!settingsRepo.checkUpdate || (isCi && !settingsRepo.checkCiUpdate) || _uiState.value.ciUpdateBusy) return
+        _uiState.update { it.copy(ciUpdateBusy = true) }
+        viewModelScope.launch {
+            try {
+                val installed = withContext(Dispatchers.IO) {
+                    com.sukisu.ultra.data.repository.CiManagerUpdater(ksuApp).updateAndInstall(info)
+                }
+                val message = if (installed) com.sukisu.ultra.R.string.ci_update_install_success
+                    else com.sukisu.ultra.R.string.ci_update_install_submitted
+                android.widget.Toast.makeText(ksuApp, message, android.widget.Toast.LENGTH_LONG).show()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                android.widget.Toast.makeText(ksuApp, e.message ?: ksuApp.getString(com.sukisu.ultra.R.string.ci_update_download_failed), android.widget.Toast.LENGTH_LONG).show()
+            } finally {
+                _uiState.update { it.copy(ciUpdateBusy = false) }
+            }
+        }
+    }
+
+    private fun loadCounts(lkmMode: Boolean?, preview: Boolean): Triple<Int?, Int?, Int?> {
+        // The allowlist and KPM live in the kernel; there is nothing to count without one.
+        val superuserCount = if (preview) null else runCatching { getSuperuserCount() }.getOrNull()
+        val moduleCount = runCatching { getModuleCount() }.getOrNull()
+        // KPM only exists on built-in kernels.
+        val kpmCount = if (preview || lkmMode == true) null else runCatching {
+            val version = getKpmVersion()
+            if (version.isEmpty() || version.contains("Error", ignoreCase = true)) null else getKpmModuleCount()
+        }.getOrNull()
+        return Triple(superuserCount, moduleCount, kpmCount)
+    }
+
+    private fun buildState(): HomeUiState {
+        val kernelVersion = getKernelVersion()
+        val isManager = Natives.isManager
+        val ksuVersion = if (isManager) Natives.version else null
+        val kernelUAPIVersion = if (isManager) Natives.kernelUAPIVersion else null
+        val managerUAPIVersion = Natives.managerUAPIVersion
+        val lkmMode = ksuVersion?.let { if (kernelVersion.isGKI()) Natives.isLkmMode else null }
+        val isRootAvailable = rootAvailable()
+        val managerVersion = getManagerVersion(ksuApp)
+        val kernelFullVersion = if (isManager) Natives.getFullVersion() else null
+
+        val zygiskImplementation = if (isManager && isRootAvailable) {
+            com.sukisu.ultra.ui.screen.home.getZygiskImplementation(
+                notInstalledText = ksuApp.getString(com.sukisu.ultra.R.string.home_zygisk_not_installed),
+                disabledText = ksuApp.getString(com.sukisu.ultra.R.string.home_zygisk_disabled),
+                rebootRequiredText = ksuApp.getString(com.sukisu.ultra.R.string.home_zygisk_reboot_required),
+            )
+        } else null
+
+        return HomeUiState(
+            kernelVersion = kernelVersion,
+            ksuVersion = ksuVersion,
+            lkmMode = lkmMode,
+            isLkmBundled = lkmMode == true && Natives.isLkmBundled,
+            isManager = isManager,
+            isManagerPrBuild = BuildConfig.IS_PR_BUILD,
+            isKernelPrBuild = Natives.isPrBuild,
+            requiresNewKernel = isManager && Natives.managerUAPIVersion > Natives.kernelUAPIVersion,
+            requiresNewManager = isManager && Natives.managerUAPIVersion < Natives.kernelUAPIVersion,
+            kernelUAPIVersion = kernelUAPIVersion,
+            managerUAPIVersion = managerUAPIVersion,
+            isRootAvailable = isRootAvailable,
+            isPreviewMode = !isManager && isRootAvailable,
+            isSafeMode = Natives.isSafeMode,
+            isLateLoadMode = Natives.isLateLoadMode,
+            checkUpdateEnabled = settingsRepo.checkUpdate,
+            checkCiUpdateEnabled = settingsRepo.checkUpdate && settingsRepo.checkCiUpdate,
+            showFullStatus = ksuApp.getSharedPreferences("settings", Context.MODE_PRIVATE)
+                .getBoolean("show_fingerprint", true),
+            latestVersionInfo = LatestVersionInfo(),
+            currentManagerVersionCode = managerVersion.versionCode,
+            systemInfo = SystemInfo(
+                kernelVersion = Os.uname().release,
+                managerVersion = "${managerVersion.versionName} (${managerVersion.versionCode}-${managerUAPIVersion})",
+                deviceModel = resolveDeviceName(),
+                kernelFullVersion = kernelFullVersion,
+                fingerprint = Build.FINGERPRINT,
+                selinuxStatus = getSELinuxStatusRaw(),
+                seccompStatus = runCatching {
+                    Os.prctl(21 /* PR_GET_SECCOMP */, 0, 0, 0, 0)
+                }.getOrDefault(-1),
+                zygiskImplementation = zygiskImplementation,
+            ),
+        )
+    }
+}
